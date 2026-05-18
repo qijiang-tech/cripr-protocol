@@ -1,0 +1,508 @@
+================================================================================
+crispr_protocol.ipynb - USER MANUAL
+================================================================================
+
+This manual is a section-by-section guide to crispr_protocol.ipynb. For a
+short overview, file inventory and the hierarchy tree, see README.txt in the
+same folder.
+
+
+Table of contents
+
+   1. What the protocol does
+   2. Launching the notebook
+   3. Running order and dependencies
+   4. Section 0  - Setup
+   5. Script 1   - Flat-field and background correction
+   6. Script 2   - Reporter calibration
+   7. Script 3   - Michaelis-Menten kinetics and self-consistency checks
+   8. Script 4   - Limit of detection
+   9. Variable glossary
+  10. Input file format requirements
+  11. Troubleshooting and local execution
+
+
+================================================================================
+1. What the protocol does
+================================================================================
+
+This notebook is the end-to-end analysis pipeline for a CRISPR-based
+diagnostic assay measured on a fluorescence plate reader. From raw 384-well
+plate images it derives:
+
+  - the kinetic parameters of the CRISPR-Cas reporter cleavage reaction
+    (Vmax, Km, kcat),
+  - the reporter calibration constants (Fcl, Fucl, c0),
+  - the reporter degradation rate (k_rep),
+  - and the two relevant Limits of Detection (LoDs) for the assay:
+
+      Endpoint LoD  (Le)  - smallest target concentration at which the
+                            endpoint fluorescence rises above the no-target
+                            control (NTC) noise floor (mean + 3 * SD).
+      Rate-based    (Lv)  - same criterion, applied to the initial reaction
+                            rate.
+
+Both LoDs are reported in two forms:
+
+  - Experimental LoD: read off the titration curve by linear interpolation.
+  - Theoretical LoD : computed in closed form from the fitted kinetic
+                      parameters (Section 4.6).
+
+
+================================================================================
+2. Launching the notebook
+================================================================================
+
+The notebook is written for Google Colab.
+
+  1. Open https://colab.research.google.com in a browser.
+  2. File -> Upload notebook -> select crispr_protocol.ipynb from this folder.
+  3. The notebook opens in a new Colab tab.
+
+You can also run it locally if you have Jupyter and numpy, pandas,
+matplotlib, scipy and ipywidgets installed - but the upload cells will fail
+outside Colab (see Section 11 of this manual for the workaround).
+
+
+================================================================================
+3. Running order and dependencies
+================================================================================
+
+  - Section 0 (Setup) MUST be the very first cell you run. It imports every
+    library and defines the plate helpers used by Script 1.
+
+  - Scripts 1, 2, 3, 4 are independent (each script uploads its own input
+    file(s) and produces its own outputs).
+
+  - Sub-cells WITHIN a script must be run in numbered order (e.g. 1.4 needs
+    BG/FF/RAW loaded by 1.1-1.3; 3.3 needs the rates from 3.2; etc.).
+
+  - The ONLY cross-script dependency is Section 4.6 (Theoretical LoD),
+    which consumes parameters from Scripts 2, 3, and 4 (see Section 8 of
+    this manual).
+
+
+================================================================================
+4. Section 0 - Setup
+================================================================================
+
+Purpose
+  Load every library the notebook will use, and define plate-layout helpers.
+
+What it does
+  - Imports numpy, pandas, matplotlib, scipy.optimize, scipy.stats,
+    scipy.interpolate, ipywidgets, IPython.display, google.colab.files.
+  - Defines the 384-well grid:
+       ROWS = A..P  (16 rows)
+       COLS = 1..24 (24 columns)
+       EXPECTED_WELLS = A1..A24, B1..B24, ..., P1..P24
+  - Defines load_384_table(path)         loads .xlsx/.csv and returns
+                                          (DataFrame, wells_list); auto-
+                                          transposes if wells are rows.
+  - Defines reshape_to_plate(values, wells)
+                                          turns a 1D well-indexed vector
+                                          into a 16x24 numpy array.
+  - Defines time_scroller(df, wells, ...)
+                                          interactive heatmap with a time
+                                          slider.
+
+Action required
+  Run the cell once. It prints "Setup complete..." when done.
+
+Run any time you reconnect the runtime - all helpers and imports live only
+in the current Python session.
+
+
+================================================================================
+5. Script 1 - Flat-field and background correction
+================================================================================
+
+Purpose
+  Convert a raw 384-well plate time series into a flat-field- and
+  background-corrected reporter signal, and download the result.
+
+Correction formula  (applied per time step, per well)
+       I_corr(t) = I_BG(t) + I_RAW(t) * ( I_FF(t) - I_BG(t) )
+
+5.1 Upload background file
+  Input  : a 384-well plate spreadsheet (.xlsx or .csv), shaped as
+           rows = time points, columns = wells A1..A24 ... P1..P24.
+  Action : a file picker opens; choose Background.xlsx.
+  Output : BG (DataFrame, time x wells), BG_wells (list of well IDs).
+
+5.2 Upload flat-field file
+  Same layout as 5.1. Produces FF, FF_wells.
+
+5.3 Upload raw data file
+  Same layout. Produces RAW, RAW_wells.
+
+5.4 Correct for flat-field and background
+  - Aligns BG, FF, RAW by common wells and common time length (any extra
+    rows are truncated).
+  - Computes Corrected = BG + RAW * (FF - BG).
+  - Renders an interactive heatmap of Corrected with a time slider.
+  Output : Corrected (DataFrame), common_wells (list).
+
+5.5 Download the corrected data
+  - Prompts you for a filename (default corrected_data.xlsx).
+  - Writes Corrected to .xlsx and triggers a browser download.
+  Note  : the browser's save dialog picks the destination folder. Colab
+          cannot pick an OS folder programmatically.
+
+
+================================================================================
+6. Script 2 - Reporter calibration
+================================================================================
+
+Purpose
+  Fit the cleaved/uncleaved fluorescence calibration model, identify the
+  three operational regimes implied by the inner-filter constant, and
+  measure the spontaneous reporter degradation rate k_rep.
+
+Calibration model
+      I_corr = 10^( -S0 / c0 ) * ( Fcl * P  +  Fucl * S )
+  where
+      P    = cleaved-reporter concentration   (nM)
+      S    = uncleaved-reporter concentration (nM)
+      S0   = P + S = total reporter (nM)
+      Fcl  = per-nM fluorescence yield of cleaved reporter
+      Fucl = per-nM fluorescence yield of uncleaved reporter
+      c0   = inner-filter attenuation scale (nM)
+
+6.1 Upload calibration file
+  Input  : .xlsx with columns named exactly c, cleaved, uncleaved.
+  Action : pick Reporter_calibration.xlsx.
+  Output : df (cleaned 3-column DataFrame).
+
+6.2 Extract signal-to-concentration conversion
+  - Plots raw calibration data.
+  - Fits Fcl_fit, Fucl_fit, c0_fit by least squares (scipy curve_fit).
+  - Reports value +/- standard error for each parameter.
+  - Plots the fitted cleaved and uncleaved curves on top of the data.
+  - Saves calibration_fit_results.xlsx alongside.
+  Output : Fcl_fit, Fucl_fit, c0_fit (floats); results_df (DataFrame).
+
+6.3 Three operational regimes
+  Uses c0_fit to split the operating range of S0 into three regimes,
+  based on the 10^(-S0/c0) inner-filter factor:
+      Linear      :  S0   <   0.04 * c0_fit       (attenuation < ~10%)
+      Transition  :  0.04 * c0_fit  <=  S0  <=  0.30 * c0_fit
+      Saturation  :  S0   >   0.30 * c0_fit       (attenuation > ~50%)
+  Output : linear_upper (= 0.04*c0_fit), satur_lower (= 0.30*c0_fit);
+           prints a summary table.
+
+6.4 Reporter degradation rate (k_rep)
+  Quantifies the per-second loss of cleaved-reporter fluorescence due to
+  intrinsic degradation. This rate feeds into the theoretical LoD (4.6).
+
+  6.4.1 Upload + plot degradation data
+    Input  : .xlsx (or .csv) with a time column, N concentration-series
+             columns, and a "blank row + concentration row" footer giving
+             each column's [Reporter] in nM.
+    Action : pick Reporter_degradation.xlsx.
+    Output : df_deg, clean_df_deg, conc_map_deg (dict well -> [Reporter] nM);
+             plot of all progress curves.
+
+  6.4.2 Fit k_rep by linear regression
+    - For each well, fit Rate = slope of [reporter] vs time across the
+      whole time span.
+    - Then fit Rate vs [Reporter]: the slope of that line is k_rep.
+    Output : deg_df (per-concentration rates), k_slope (= k_rep, units 1/s),
+             printed value.
+
+
+================================================================================
+7. Script 3 - Michaelis-Menten kinetics and self-consistency checks
+================================================================================
+
+Purpose
+  From a substrate-titration of progress curves, extract initial reaction
+  rates, fit the Michaelis-Menten model to obtain Vmax and Km, derive kcat
+  from a user-provided E0, and check three dimensionless self-consistency
+  parameters.
+
+7.1 Upload progress curve data (varying substrate)
+  Input  : .xlsx or .csv with
+             - a "Time [s]" column,
+             - replicate well columns whose values are REPORTER
+               CONCENTRATION IN nM (i.e. after the Script 2 calibration),
+             - one row whose first cell is exactly "Substrate" giving each
+               replicate column's [S0] in nM,
+             - data columns start at the 3rd column (first_data_col = 2).
+  Action : pick VaryingSubstrate.xlsx.
+  Output : df (DataFrame), time_col = "Time [s]", first_data_col = 2.
+
+7.2 Extract initial reaction rate
+  - Plots all progress curves color-coded by [S0].
+  - For each replicate well: linear regression of [reporter] vs time over
+    the first N time points (default N = 5, exposed as a Colab @param slider
+    named first_n_cycles_for_initial_rate).
+  - Returns per-replicate rates and the per-[S0] mean and SD.
+  Output : replicate_rate_df  (Replicate, Substrate_nM,
+                               Initial_Rate_nM_per_s, R_squared, p_value,
+                               Slope_SE);
+           grouped_rate_df    (Substrate_nM, Mean_Initial_Rate_nM_per_s,
+                               SD_Initial_Rate_nM_per_s, N).
+
+7.3 Michaelis-Menten analysis
+  Fits  v(S) = Vmax * S / (Km + S)  to the per-replicate rates by
+  nonlinear least squares. Reports:
+     - Vmax, Km (and standard errors and 95% CIs),
+     - R^2 and Sy.x,
+     - SD of replicates (pure error) and SD of lack-of-fit, with an
+       F-test comparing them,
+     - the fitted curve overlaid on the data.
+  Output : mm_results  (dict with Vmax, Km, Vmax_SE, Km_SE, Vmax_CI, Km_CI,
+                        R_squared, SS_res, Syx, SD_replicates,
+                        SD_lack_of_fit, F_value, P_value, S_curve, v_curve).
+
+7.4 Self-consistency check
+  Tests whether the initial-rate fit window was actually in the initial,
+  approximately linear regime of the progress curves.
+
+  7.4.1 Extract derived variables, compute kcat
+    Pulls:
+      t_lin_max                  = max time used in the rate-fit window (s)
+      max_mean_reaction_velocity = largest per-[S0] mean rate (nM/s)
+      S0_at_max_velocity         = the [S0] where that maximum occurred (nM)
+    Prompts you for E0 in nM (the enzyme concentration in the substrate
+    titration), then computes:
+      kcat = Vmax / E0     (units 1/s)
+
+  7.4.2 alpha, beta, gamma
+    Dimensionless self-consistency parameters; the protocol expects all
+    three to be small.
+      alpha = ( v_max_observed * t_lin_max ) / S0_at_max_velocity
+      beta  =   v_max_observed / Vmax
+      gamma = ( t_lin_max * Vmax ) /
+              ( Km + S0_at_max_velocity * ( 1 - 1/e ) )
+    Output : alpha, beta, gamma (floats).
+
+
+================================================================================
+8. Script 4 - Limit of detection
+================================================================================
+
+Purpose
+  From a target-titration of progress curves, derive both the endpoint LoD
+  (Le) and the rate-based LoD (Lv) experimentally, then compare against the
+  theoretical LoD computed from the fitted kinetic parameters.
+
+8.1 Upload progress curve data (varying target)
+  Input  : .xlsx or .csv with
+             - a "Time [s]" column,
+             - replicate columns of reporter concentration (nM),
+             - one row whose first cell contains the word "Target" giving
+               each column's target concentration in nM.
+  Action : pick VaryingTarget.xlsx.
+  Output : df_tar (DataFrame).
+
+8.2 Extract endpoint signals
+  - Locates the "Target" label row in df_tar to read each well's target
+    concentration.
+  - For each well, takes the LAST numeric value of the time-series as the
+    endpoint signal.
+  Output : target_endpoint_df  (Well, Target_Concentration_nM,
+                                Endpoint_Signal_AU);
+           time_col (used downstream by 4.6).
+
+8.3 Determine endpoint LoD Le
+  8.3.1 NTC threshold P_thr + plot
+    - Identifies the lowest-target group as the No-Target Control (NTC).
+    - Computes mean_ntc_signal and std_ntc_signal across those wells.
+    - P_thr = mean_ntc_signal + 3 * std_ntc_signal.
+    - Plots endpoint vs target on a log-log scale with a horizontal line
+      at P_thr.
+    Output : P_thr.
+
+  8.3.2 Interpolate Le at P_thr
+    Linear interpolation of target concentration as a function of endpoint
+    signal, evaluated at y = P_thr.
+    Output : LoD (the experimental endpoint LoD Le, in nM).
+
+8.4 Extract initial reaction rates
+  Same approach as 7.2 but applied to df_tar: per-well linear fit of
+  [reporter] vs time over the first N points (configurable via
+  first_n_cycles_for_initial_rate).
+  Output : replicate_rate_df_tar (Well, Target_Concentration_nM,
+                                  Initial_Rate_nM_per_s, R_squared).
+
+8.5 Determine rate-based LoD Lv
+  8.5.1 NTC threshold Rate_thr + plot
+    Same NTC logic as 8.3.1 but on initial rates.
+    Output : Rate_thr = mean_ntc_rate + 3 * std_ntc_rate.
+
+  8.5.2 Interpolate Lv at Rate_thr
+    Linear interpolation of target concentration as a function of rate,
+    evaluated at x = Rate_thr.
+    Output : rate_based_LoD (the experimental rate-based LoD Lv, in nM).
+
+8.6 Theoretical LoD (Le, Lv)
+  Prompts you for a substrate concentration S0 (nM). Then computes:
+
+      theo_Lv = ( Km + S0 ) * k_rep / kcat
+
+      theo_Le = ( Km + S0 ) * (Fcl - Fucl) * k_rep * t_max
+                / ( -Fcl + (Fcl - Fucl) * kcat * t_max )
+
+  where t_max is the latest time point in df_tar.
+
+  IMPORTANT: this is the ONLY cell that crosses Script boundaries.
+  Before running it, the following must already be in the Python session:
+      Km             from Section 3.3
+      kcat           from Section 3.4.1
+      Fcl_fit, Fucl_fit
+                     from Section 2.2
+      k_slope        from Section 2.4.2 (interpreted as k_rep)
+      df_tar         from Section 4.1
+      time_col       from Section 4.2
+  If any are missing the cell prints "A required parameter is missing"
+  and names the offending variable.
+
+
+================================================================================
+9. Variable glossary
+================================================================================
+
+  Plate-level (Script 1)
+    BG, FF, RAW                    raw plate DataFrames (time x well)
+    BG_wells, FF_wells, RAW_wells  the well IDs found in each
+    common_wells                   wells present in all three
+    Corrected                      BG + RAW * (FF - BG)
+
+  Calibration (Script 2)
+    df                             calibration DataFrame (c, cleaved,
+                                   uncleaved); reused in Script 3 as the
+                                   substrate-titration DataFrame
+    S0, I_cleaved, I_uncleaved     arrays pulled from df
+    Fcl_fit                        cleaved-reporter fluorescence yield
+    Fucl_fit                       uncleaved-reporter fluorescence yield
+    c0_fit                         inner-filter scale (nM)
+    linear_upper                   0.04 * c0_fit
+    satur_lower                    0.30 * c0_fit
+    df_deg, clean_df_deg           degradation DataFrames (Section 2.4)
+    conc_map_deg                   {well -> reporter concentration (nM)}
+    deg_df                         per-concentration degradation rates
+    k_slope (= k_rep)              reporter degradation rate (1/s)
+
+  Kinetics (Script 3)
+    df                             substrate-titration DataFrame (Section
+                                   3.1 reassigns df)
+    time_col                       "Time [s]"
+    first_data_col                 2 (replicate columns start here)
+    first_n_cycles_for_initial_rate
+                                   user-tunable @param (default 5)
+    replicate_rate_df              per-well initial rates
+    grouped_rate_df                per-[S0] mean/SD of rates
+    mm_results                     dict of MM-fit results
+    Vmax, Km                       Michaelis-Menten parameters
+    E0                             user-entered enzyme concentration (nM)
+    kcat                           Vmax / E0  (1/s)
+    t_lin_max                      max time in the rate-fit window (s)
+    max_mean_reaction_velocity     largest per-[S0] mean rate
+    S0_at_max_velocity             [S0] at which that max occurs
+    alpha, beta, gamma             self-consistency numbers
+
+  LoD (Script 4)
+    df_tar                         target-titration DataFrame
+    target_endpoint_df             per-well endpoint signal table
+    P_thr                          endpoint NTC threshold (mean + 3*SD)
+    LoD                            experimental endpoint LoD (Le)
+    replicate_rate_df_tar          per-well initial rates from df_tar
+    Rate_thr                       rate NTC threshold (mean + 3*SD)
+    rate_based_LoD                 experimental rate-based LoD (Lv)
+    theo_Lv, theo_Le               theoretical LoDs from Section 4.6
+
+
+================================================================================
+10. Input file format requirements
+================================================================================
+
+  Script 1 - BG / FF / RAW plates
+    .xlsx or .csv.
+    Rows : time points (in the order they were recorded).
+    Cols : 384 well headers A1..A24 ... P1..P24. Missing wells are tolerated
+           with a warning; extra columns are ignored. If your file is shaped
+           384 rows x N cols, load_384_table auto-transposes it.
+
+  Script 2.1 - calibration
+    .xlsx with columns named EXACTLY:
+       c          total reporter concentration S0 (nM)
+       cleaved    fluorescence at S0 with all reporter cleaved (RFU)
+       uncleaved  fluorescence at S0 with all reporter uncleaved (RFU)
+    Extra unnamed columns are dropped automatically.
+
+  Script 2.4 - degradation
+    .xlsx or .csv with:
+       - a Time column (any header containing the word "time")
+       - N concentration-series columns
+       - exactly ONE blank row separating the time-series from a row that
+         gives each column's [Reporter] in nM.
+
+  Script 3.1 - substrate titration
+    .xlsx or .csv with:
+       - a "Time [s]" column
+       - replicate well columns containing REPORTER CONCENTRATION IN nM
+         (apply Script 2's calibration first)
+       - one row whose first cell is exactly "Substrate" giving each
+         replicate column's [S0] in nM
+       - replicate data starts at the 3rd column (first_data_col = 2).
+
+  Script 4.1 - target titration
+    Same layout as 3.1, but the label row first-cell value contains the
+    word "Target" (case-insensitive) and the values are target
+    concentrations in nM.
+
+
+================================================================================
+11. Troubleshooting and local execution
+================================================================================
+
+Common error messages and what they usually mean:
+
+  "ModuleNotFoundError: No module named 'google.colab'"
+    You are running outside Colab. Either upload to Colab, or replace each
+        uploaded = files.upload()
+        filename = list(uploaded.keys())[0]
+    block with
+        filename = "path/to/your_file.xlsx"
+    and skip the files.download() call in 1.5.
+
+  "Did not find well headers like 'A1'..."
+    The plate file's column headers aren't A1..P24. Either rename the
+    headers, or transpose the sheet so that wells are in columns.
+
+  "Could not find a row labeled 'Substrate'"           (Script 3.1 / 3.2)
+  "Could not find a row containing 'Target'"           (Script 4.1 / 4.2)
+    Add the label row in column 1 with the per-column concentrations
+    across the data columns. Matching is case-insensitive; "Substrate"
+    must be an exact match for Script 3, while Script 4 only needs the
+    cell to CONTAIN the substring "target".
+
+  "P_thr is below/above the minimum/maximum Endpoint Signal" (Section 4.3.2)
+  "Rate_thr is below/above the minimum/maximum Initial Reaction Rate"
+                                                              (Section 4.5.2)
+    The NTC threshold is outside the range of your titration data, so LoD
+    cannot be interpolated. Widen the titration range or re-examine the
+    NTC measurement.
+
+  "A required parameter is missing" (Section 4.6)
+    The theoretical LoD cell tried to read a variable produced by an
+    earlier section that hasn't been run yet. Run 2.2, 2.4.2, 3.3, 3.4.1,
+    4.1 and 4.2 first, then re-run 4.6.
+
+  "mm_results is not defined" (Section 3.4.1 or 3.4.2)
+    Section 3.3 hasn't been executed in this session. Run 3.3 first.
+
+  Interactive widgets / plots are blank or unresponsive
+    Re-run Section 0 (Setup). matplotlib and ipywidgets state can become
+    inconsistent if you reconnect the Colab runtime without re-running the
+    imports.
+
+  E0 / S0 prompt won't accept your number
+    Use a plain decimal (e.g. 10  or  10.0), no units. Negative or zero
+    values are rejected for E0.
+
+================================================================================
+End of manual.
+================================================================================
